@@ -1,7 +1,7 @@
 import requests
 import streamlit as st
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import List, Dict, Tuple, Optional
 
 # =========================================================
 # Page
@@ -9,44 +9,17 @@ from typing import Dict, List, Tuple
 st.set_page_config(page_title="나와 어울리는 영화는?", page_icon="🎬", layout="wide")
 
 # =========================================================
-# ✅ 팀원끼리 바꿀 포인트(내가 기본값으로 정함)
+# 1) Config Layer (팀 논의 결과를 반영하는 곳)
+#    - 질문, 선택지, 장르 맵핑, TMDB 장르ID, 문구 등
 # =========================================================
-TEAM_TUNING = {
-    # 질문/가중치
-    "QUESTION_WEIGHTS": {  # 질문별 가중치(팀이 논의하면서 숫자만 바꾸면 됨)
-        "q1": 1,
-        "q2": 1,
-        "q3": 1,
-        "q4": 2,  # 과제/현실도피 문항은 성향이 강하게 드러난다고 가정
-        "q5": 2,  # “주인공 설정”은 취향 확실하다고 가정
-    },
 
-    # 타이브레이커(동점일 때)
-    "TIE_BREAKER_ORDER": ["sf_fantasy", "action_adventure", "romance_drama", "comedy"],
-
-    # 혼합장르(Top2를 섞어서 추천)
-    "MIXED_GENRE_TOP_N": 2,           # 2면 Top2 혼합 추천 / 1이면 단일 장르
-    "MIXED_GENRE_RATIO": [0.6, 0.4],  # Top1:Top2 비율(추천 개수 배분)
-
-    # 카드 UI
-    "CARDS_PER_ROW": 3,
-    "SHOW_OVERVIEW_PREVIEW": False,   # 카드에 줄거리 미리보기 표시 여부
-    "OVERVIEW_PREVIEW_LEN": 90,
-
-    # 정렬/추천수
-    "TMDB_SORT_BY": "popularity.desc",  # popularity.desc / vote_average.desc / revenue.desc
-    "RECOMMEND_COUNT": 6,              # 추천 영화 수
-}
-
-# =========================================================
-# Data Models
-# =========================================================
 @dataclass(frozen=True)
 class GenreProfile:
-    key: str
-    label: str
-    tmdb_ids: List[int]
-    base_reason: str
+    key: str                      # 내부 키
+    label: str                    # 사용자 노출
+    tmdb_ids: List[int]           # TMDB 장르 ID(여러 개 가능)
+    base_reason: str              # 결과 상단 문구
+    tie_priority: int             # 동점일 때 우선순위 (낮을수록 우선)
 
 GENRES: Dict[str, GenreProfile] = {
     "romance_drama": GenreProfile(
@@ -54,27 +27,33 @@ GENRES: Dict[str, GenreProfile] = {
         label="로맨스/드라마",
         tmdb_ids=[10749, 18],
         base_reason="감정선과 관계의 변화를 좋아하는 편이라, 여운이 긴 이야기와 몰입감 있는 드라마가 잘 맞아요.",
+        tie_priority=1,
     ),
     "action_adventure": GenreProfile(
         key="action_adventure",
         label="액션/어드벤처",
-        tmdb_ids=[28],
+        tmdb_ids=[28],  # 요구사항에 어드벤처 ID는 없어서 액션 중심
         base_reason="짜릿한 전개와 도전/성장 서사를 선호해서, 속도감 있는 액션 계열이 딱이에요.",
+        tie_priority=2,
     ),
     "sf_fantasy": GenreProfile(
         key="sf_fantasy",
         label="SF/판타지",
         tmdb_ids=[878, 14],
         base_reason="세계관·상상력·설정에 끌리는 편이라, 현실을 확장하는 SF/판타지가 잘 맞아요.",
+        tie_priority=3,
     ),
     "comedy": GenreProfile(
         key="comedy",
         label="코미디",
         tmdb_ids=[35],
         base_reason="웃음 포인트와 가벼운 템포를 즐겨서, 스트레스 풀기 좋은 코미디가 잘 맞아요.",
+        tie_priority=4,
     ),
 }
 
+# 질문/선택지:
+# - (genre_key, text) 형태로 둬서 나중에 문항/선택지 교체해도 로직이 안 깨짐
 QUESTIONS: List[Dict] = [
     {
         "id": "q1",
@@ -128,75 +107,117 @@ QUESTIONS: List[Dict] = [
     },
 ]
 
-TMDB_DISCOVER_URL = "https://api.themoviedb.org/3/discover/movie"
 POSTER_BASE = "https://image.tmdb.org/t/p/w500"
+TMDB_DISCOVER_URL = "https://api.themoviedb.org/3/discover/movie"
 
 
 # =========================================================
-# Sidebar
+# 2) Sidebar Controls (팀이 실험할 수 있는 옵션들)
 # =========================================================
-st.sidebar.header("TMDB 설정")
-api_key = st.sidebar.text_input("TMDB API Key", type="password")
-language = st.sidebar.selectbox("언어", ["ko-KR", "en-US"], index=0)
-st.sidebar.caption("추천/로직 변경은 코드 상단 TEAM_TUNING만 수정하면 돼요.")
+st.sidebar.header("설정 / 실험 패널")
+
+api_key = st.sidebar.text_input("TMDB API Key", type="password", help="TMDB API 키를 입력하세요.")
+
+language = st.sidebar.selectbox("TMDB 언어", ["ko-KR", "en-US"], index=0)
+
+# 추천 수, 레이아웃
+num_recs = st.sidebar.slider("추천 영화 수", 3, 12, 6, step=1)
+cards_per_row = st.sidebar.selectbox("카드 열 수", [2, 3, 4], index=1)
+
+# 정렬 기준 실험(Discover API에 sort_by 활용)
+sort_by = st.sidebar.selectbox(
+    "정렬 기준",
+    [
+        ("popularity.desc", "인기순"),
+        ("vote_average.desc", "평점순(주의: 표본 적을 수 있음)"),
+        ("revenue.desc", "흥행(매출)순"),
+    ],
+    index=0,
+    format_func=lambda x: x[1],
+)[0]
+
+poster_first = st.sidebar.checkbox("포스터 있는 영화 우선", value=True)
+show_overview_in_card = st.sidebar.checkbox("카드에 줄거리 일부 표시", value=False)
+
+st.sidebar.divider()
 
 
 # =========================================================
-# Scoring / Decision
+# 3) Scoring Layer (심리테스트 방식 교체가 쉬운 부분)
+#    - 지금은 기본: 다수결 + 동점 우선순위
+#    - 팀 논의로: 가중치, 최근 선택 가중, 질문별 가중 등 쉽게 변경 가능
 # =========================================================
+
 def score_answers(answers: Dict[str, str]) -> Dict[str, int]:
-    scores = {k: 0 for k in GENRES.keys()}
-    for qid, gkey in answers.items():
-        w = TEAM_TUNING["QUESTION_WEIGHTS"].get(qid, 1)
-        scores[gkey] += w
+    """
+    answers: {question_id: genre_key}
+    return:  {genre_key: score}
+    """
+    scores = {g: 0 for g in GENRES.keys()}
+    for _, gkey in answers.items():
+        if gkey in scores:
+            scores[gkey] += 1
     return scores
 
 
-def pick_top_genres(scores: Dict[str, int], top_n: int) -> List[str]:
-    # 점수 내림차순, 동점 시 tie-breaker order로 정렬
-    tie_rank = {k: i for i, k in enumerate(TEAM_TUNING["TIE_BREAKER_ORDER"])}
-    ordered = sorted(
-        scores.items(),
-        key=lambda kv: (-kv[1], tie_rank.get(kv[0], 999)),
-    )
-    return [k for k, _ in ordered[:top_n]]
+def pick_genre(scores: Dict[str, int]) -> GenreProfile:
+    """
+    다수결. 동점이면 tie_priority가 낮은 장르 우선.
+    """
+    max_score = max(scores.values()) if scores else 0
+    tied = [k for k, v in scores.items() if v == max_score]
+
+    # tie priority로 선택
+    tied_profiles = [GENRES[k] for k in tied]
+    tied_profiles.sort(key=lambda gp: gp.tie_priority)
+    return tied_profiles[0]
 
 
-def build_result_reason(top_keys: List[str], scores: Dict[str, int]) -> str:
+def build_reason(profile: GenreProfile, scores: Dict[str, int]) -> str:
+    """
+    결과 이유 문구(팀 논의로 얼마든지 확장 가능)
+    """
     total = sum(scores.values()) or 1
-    parts = []
-    for k in top_keys:
-        pct = int(round(scores[k] / total * 100))
-        parts.append(f"{GENRES[k].label} {pct}%")
-    return " / ".join(parts)
+    main_pct = int(round(scores[profile.key] / total * 100))
+    return f"{profile.base_reason} (일치도 약 {main_pct}%)"
 
 
-def movie_reason(main: GenreProfile, movie: dict) -> str:
+def movie_reason(profile: GenreProfile, movie: dict) -> str:
+    """
+    영화별 추천 이유(간단)
+    """
     overview = (movie.get("overview") or "").strip()
     vote = movie.get("vote_average")
     score_hint = f"평점 {vote:.1f}" if isinstance(vote, (int, float)) else "평점 정보"
 
-    if main.key == "romance_drama":
-        hook = "감정선과 관계의 흐름을 좋아하는 타입이라"
+    if profile.key == "romance_drama":
+        hook = "감정선/관계 변화에 몰입하기 좋은 타입이라"
         extra = "여운이 남는 전개" if overview else "인물 중심 이야기"
-    elif main.key == "action_adventure":
-        hook = "전개가 빠르고 사건이 몰아치는 걸 좋아해서"
-        extra = "긴장감 있는 흐름" if overview else "속도감 있는 액션"
-    elif main.key == "sf_fantasy":
-        hook = "세계관/설정 취향이 강해서"
+    elif profile.key == "action_adventure":
+        hook = "속도감 있는 전개를 좋아해서"
+        extra = "긴장감 있는 흐름" if overview else "액션/모험의 재미"
+    elif profile.key == "sf_fantasy":
+        hook = "세계관·설정 취향이 강해서"
         extra = "상상력 자극 설정" if overview else "독특한 분위기"
     else:
-        hook = "가볍게 웃으며 보기 좋은 작품을 선호해서"
-        extra = "유쾌한 톤" if overview else "기분 전환에 좋음"
+        hook = "기분 전환용 작품을 선호해서"
+        extra = "유쾌한 톤" if overview else "가볍게 즐기기 좋음"
 
     return f"{hook} **{extra}**가 잘 맞아요. ({score_hint})"
 
 
 # =========================================================
-# TMDB Client
+# 4) TMDB Client Layer (API 연동/캐시/에러 처리)
 # =========================================================
+
 @st.cache_data(show_spinner=False, ttl=60 * 10)
-def tmdb_discover(api_key: str, genre_id: int, language: str, sort_by: str, page: int) -> List[dict]:
+def tmdb_discover(
+    api_key: str,
+    genre_id: int,
+    language: str,
+    sort_by: str,
+    page: int = 1,
+) -> List[dict]:
     params = {
         "api_key": api_key,
         "with_genres": str(genre_id),
@@ -209,131 +230,170 @@ def tmdb_discover(api_key: str, genre_id: int, language: str, sort_by: str, page
     return r.json().get("results", [])
 
 
-def fetch_movies_for_profile(api_key: str, profile: GenreProfile, language: str, sort_by: str, need: int) -> List[dict]:
-    # profile.tmdb_ids 각각에서 1~2페이지 가져와 병합
-    results, seen = [], set()
+def fetch_recommendations(
+    api_key: str,
+    profile: GenreProfile,
+    language: str,
+    sort_by: str,
+    limit: int,
+) -> List[dict]:
+    """
+    장르가 2개 이상일 수 있으므로:
+    - 각 장르ID에서 1~2페이지 정도 가져와 병합
+    - 중복 제거 후 상위 limit개 반환
+    """
+    results: List[dict] = []
+    seen_ids = set()
+
+    # 장르별로 병합
     for gid in profile.tmdb_ids:
         for page in (1, 2):
             chunk = tmdb_discover(api_key, gid, language, sort_by, page)
             for m in chunk:
                 mid = m.get("id")
-                if not mid or mid in seen:
+                if not mid or mid in seen_ids:
                     continue
-                seen.add(mid)
+                seen_ids.add(mid)
                 results.append(m)
-            if len(results) >= need * 3:
+            if len(results) >= max(limit * 3, 20):
                 break
-        if len(results) >= need * 3:
+        if len(results) >= max(limit * 3, 20):
             break
+
     return results
 
 
-def pick_top_unique(movies: List[dict], limit: int, poster_first: bool = True) -> List[dict]:
-    def rating(m):
+# =========================================================
+# 5) UI Rendering Layer (화면 구성만 담당)
+# =========================================================
+
+def render_quiz() -> Dict[str, str]:
+    """
+    질문 화면 렌더링 후 answers 반환
+    answers: {question_id: genre_key}
+    """
+    st.title("🎬 나와 어울리는 영화는?")
+    st.write("대학생 감성 5문항 심리테스트! 😄 가장 끌리는 선택지를 고르면, 취향에 맞는 영화를 추천해줘요.")
+    st.divider()
+
+    answers: Dict[str, str] = {}
+
+    for q in QUESTIONS:
+        opts = q["options"]
+        # 라디오에 보여줄 라벨과 내부 값 분리
+        labels = [f"{text}  —  [{GENRES[gkey].label}]" for (gkey, text) in opts]
+        values = [gkey for (gkey, _) in opts]
+
+        picked = st.radio(q["text"], labels, index=None, key=q["id"])
+        if picked is not None:
+            # label에서 인덱스 찾아 values로 매핑
+            idx = labels.index(picked)
+            answers[q["id"]] = values[idx]
+
+        st.write("")
+
+    st.divider()
+    return answers
+
+
+def render_movie_cards(
+    movies: List[dict],
+    profile: GenreProfile,
+    limit: int,
+    cards_per_row: int,
+    poster_first: bool,
+    show_overview_in_card: bool,
+):
+    # 정렬/필터(로컬 측)
+    def rating_val(m): 
         v = m.get("vote_average")
         return v if isinstance(v, (int, float)) else 0.0
 
     if poster_first:
-        movies = sorted(movies, key=lambda m: (m.get("poster_path") is None, -rating(m)))
+        movies = sorted(movies, key=lambda m: (m.get("poster_path") is None, -rating_val(m)))
 
-    out, seen_titles = [], set()
+    # top N
+    final: List[dict] = []
+    seen_title = set()
     for m in movies:
         title = (m.get("title") or "").strip()
-        if not title or title in seen_titles:
+        if not title or title in seen_title:
             continue
-        seen_titles.add(title)
-        out.append(m)
-        if len(out) >= limit:
+        seen_title.add(title)
+        final.append(m)
+        if len(final) >= limit:
             break
-    return out
 
+    if not final:
+        st.info("추천할 영화를 찾지 못했어요. (TMDB 결과가 비었거나 필터링 중 제거됨)")
+        return
 
-def build_mixed_recommendations(
-    api_key: str,
-    top_keys: List[str],
-    language: str,
-    sort_by: str,
-    total_count: int,
-) -> List[Tuple[str, dict]]:
-    """
-    Top2 혼합 추천:
-      - Top1에서 60%, Top2에서 40% 비율로 추천 개수 배분
-      - 반환: [(genre_key, movie), ...]  (카드에 '출처 장르' 표시할 수도 있음)
-    """
-    ratios = TEAM_TUNING["MIXED_GENRE_RATIO"]
-    # top_keys 길이에 맞춰 ratio를 자르거나 기본값 적용
-    ratios = (ratios + [0.0] * len(top_keys))[: len(top_keys)]
-    # 개수 배분
-    counts = [max(0, int(round(total_count * r))) for r in ratios]
-    # 라운딩 오차 보정: 부족분은 1번 장르에 더함
-    diff = total_count - sum(counts)
-    if counts:
-        counts[0] += diff
+    st.markdown("### 🎥 추천 영화")
 
-    mixed: List[Tuple[str, dict]] = []
-    for gkey, n in zip(top_keys, counts):
-        if n <= 0:
-            continue
-        prof = GENRES[gkey]
-        pool = fetch_movies_for_profile(api_key, prof, language, sort_by, need=n)
-        picks = pick_top_unique(pool, n, poster_first=True)
-        mixed.extend([(gkey, m) for m in picks])
+    cols = st.columns(cards_per_row, gap="large")
 
-    return mixed
+    for i, m in enumerate(final):
+        title = m.get("title") or "제목 없음"
+        rating = m.get("vote_average")
+        overview = (m.get("overview") or "").strip()
+        poster_path = m.get("poster_path")
+
+        with cols[i % cards_per_row]:
+            with st.container(border=True):
+                if poster_path:
+                    st.image(POSTER_BASE + poster_path, use_container_width=True)
+                else:
+                    st.caption("포스터 없음")
+
+                st.markdown(f"**{title}**")
+                if isinstance(rating, (int, float)):
+                    st.write(f"⭐ 평점: **{rating:.1f}**")
+                else:
+                    st.write("⭐ 평점: 정보 없음")
+
+                if show_overview_in_card and overview:
+                    preview = overview if len(overview) <= 90 else overview[:90].rstrip() + "…"
+                    st.caption(preview)
+
+                with st.expander("상세 보기"):
+                    st.write(overview if overview else "줄거리 정보가 없어요.")
+                    st.info("💡 " + movie_reason(profile, m))
 
 
 # =========================================================
-# UI: Quiz
+# 6) App Flow
 # =========================================================
-st.title("🎬 나와 어울리는 영화는?")
-st.write("대학생 감성 5문항 심리테스트! 😄 가장 끌리는 선택지를 고르면, 취향에 맞는 영화를 추천해줘요.")
-st.divider()
+answers = render_quiz()
 
-answers: Dict[str, str] = {}
-for q in QUESTIONS:
-    labels = [f"{text}  —  [{GENRES[g].label}]" for g, text in q["options"]]
-    values = [g for g, _ in q["options"]]
-    picked = st.radio(q["text"], labels, index=None, key=q["id"])
-    if picked is not None:
-        idx = labels.index(picked)
-        answers[q["id"]] = values[idx]
-    st.write("")
-
-st.divider()
-
-# =========================================================
-# UI: Result
-# =========================================================
+# 버튼 영역
 if st.button("결과 보기", type="primary"):
+    # 기본 검증
     if not api_key:
-        st.error("사이드바에 TMDB API Key를 입력해줘!")
+        st.error("사이드바에 TMDB API Key를 먼저 입력해줘!")
         st.stop()
 
     if len(answers) < len(QUESTIONS):
         st.warning("모든 질문에 답해야 결과를 볼 수 있어요.")
         st.stop()
 
+    # 1) 분석
     scores = score_answers(answers)
+    profile = pick_genre(scores)
 
-    # 혼합 장르 Top2 추천 (기본)
-    top_n = TEAM_TUNING["MIXED_GENRE_TOP_N"]
-    top_keys = pick_top_genres(scores, top_n=top_n)
-
-    # 결과 제목: 메인 장르(Top1)로 표시
-    main_profile = GENRES[top_keys[0]]
-    st.markdown(f"## ✨ 당신에게 딱인 장르는: **{main_profile.label}**!")
-    st.caption(build_result_reason(top_keys, scores))
-    st.caption(main_profile.base_reason)
+    # 2) 결과 헤더 (요구사항 형태로)
+    st.markdown(f"## ✨ 당신에게 딱인 장르는: **{profile.label}**!")
+    st.caption(build_reason(profile, scores))
     st.write("")
 
+    # 3) TMDB 로딩
     with st.spinner("분석 중... (TMDB에서 인기 영화를 불러오는 중)"):
         try:
-            mixed = build_mixed_recommendations(
+            movies = fetch_recommendations(
                 api_key=api_key,
-                top_keys=top_keys,
+                profile=profile,
                 language=language,
-                sort_by=TEAM_TUNING["TMDB_SORT_BY"],
-                total_count=TEAM_TUNING["RECOMMEND_COUNT"],
+                sort_by=sort_by,
+                limit=num_recs,
             )
         except requests.HTTPError:
             st.error("TMDB 요청에 실패했어요. API Key가 맞는지 확인해줘요.")
@@ -343,47 +403,13 @@ if st.button("결과 보기", type="primary"):
             st.exception(e)
             st.stop()
 
-    if not mixed:
-        st.info("추천할 영화를 찾지 못했어요. 잠시 후 다시 시도해줘요.")
-        st.stop()
+    # 4) 카드 UI
+    render_movie_cards(
+        movies=movies,
+        profile=profile,
+        limit=num_recs,
+        cards_per_row=cards_per_row,
+        poster_first=poster_first,
+        show_overview_in_card=show_overview_in_card,
+    )
 
-    st.markdown("### 🎥 추천 영화")
-
-    cols = st.columns(TEAM_TUNING["CARDS_PER_ROW"], gap="large")
-
-    for i, (source_gkey, m) in enumerate(mixed):
-        title = m.get("title") or "제목 없음"
-        rating = m.get("vote_average")
-        overview = (m.get("overview") or "").strip()
-        poster_path = m.get("poster_path")
-
-        with cols[i % TEAM_TUNING["CARDS_PER_ROW"]]:
-            with st.container(border=True):
-                # 포스터
-                if poster_path:
-                    st.image(POSTER_BASE + poster_path, use_container_width=True)
-                else:
-                    st.caption("포스터 없음")
-
-                # 제목/평점
-                st.markdown(f"**{title}**")
-                if isinstance(rating, (int, float)):
-                    st.write(f"⭐ 평점: **{rating:.1f}**")
-                else:
-                    st.write("⭐ 평점: 정보 없음")
-
-                # (혼합 추천일 경우) 이 카드가 어느 쪽 장르에서 왔는지 표시
-                if top_n >= 2:
-                    st.caption(f"🎯 추천 출처: {GENRES[source_gkey].label}")
-
-                # 카드에 줄거리 미리보기(옵션)
-                if TEAM_TUNING["SHOW_OVERVIEW_PREVIEW"] and overview:
-                    preview_len = TEAM_TUNING["OVERVIEW_PREVIEW_LEN"]
-                    preview = overview if len(overview) <= preview_len else overview[:preview_len].rstrip() + "…"
-                    st.caption(preview)
-
-                # 상세 보기
-                with st.expander("상세 보기"):
-                    st.write(overview if overview else "줄거리 정보가 없어요.")
-                    # 추천 이유는 메인 장르 기준으로 설명(팀 논의로 source_gkey 기준으로 바꿔도 됨)
-                    st.info("💡 " + movie_reason(main_profile, m))
