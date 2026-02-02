@@ -1,26 +1,26 @@
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="나와 어울리는 영화는?", page_icon="🎬", layout="centered")
+st.set_page_config(page_title="나와 어울리는 영화는?", page_icon="🎬", layout="wide")
 
-# ---------------------------
+# =========================
 # Sidebar: API Key input
-# ---------------------------
+# =========================
 st.sidebar.header("TMDB 설정")
 api_key = st.sidebar.text_input("TMDB API Key", type="password", help="TMDB API 키를 입력하세요.")
-st.sidebar.caption("키는 화면에 저장되지 않아요. (세션 동안만 사용)")
+st.sidebar.caption("키는 세션 동안만 사용돼요.")
 
-# ---------------------------
+# =========================
 # App header
-# ---------------------------
+# =========================
 st.title("🎬 나와 어울리는 영화는?")
-st.write("대학생 감성 5문항 심리테스트! 😄 가장 끌리는 선택지를 골라보면, 취향에 맞는 영화를 5편 추천해줘요.")
+st.write("대학생 감성 5문항 심리테스트! 😄 가장 끌리는 선택지를 고르면, 취향에 맞는 영화를 추천해줘요.")
 
 st.divider()
 
-# ---------------------------
+# =========================
 # Genre mapping
-# ---------------------------
+# =========================
 GENRE_INFO = {
     "로맨스/드라마": {
         "tmdb_ids": [10749, 18],  # 로맨스 + 드라마
@@ -28,7 +28,7 @@ GENRE_INFO = {
         "reason": "감정선과 관계의 변화를 좋아하는 편이라, 여운이 긴 이야기와 몰입감 있는 드라마가 잘 맞아요.",
     },
     "액션/어드벤처": {
-        "tmdb_ids": [28],  # 액션 (어드벤처는 별도 ID가 있지만 요구사항에 없어서 액션 중심)
+        "tmdb_ids": [28],  # 액션 중심
         "label": "액션/어드벤처",
         "reason": "짜릿한 전개와 도전/성장 서사를 선호해서, 속도감 있는 액션 계열이 딱이에요.",
     },
@@ -44,10 +44,9 @@ GENRE_INFO = {
     },
 }
 
-# ---------------------------
+# =========================
 # Questions
-# Each option starts with a tag key we can parse reliably
-# ---------------------------
+# =========================
 questions = [
     {
         "q": "1. 오랜만에 하루가 통째로 비는 날, 가장 하고 싶은 건?",
@@ -96,11 +95,11 @@ questions = [
     },
 ]
 
-# ---------------------------
+# =========================
 # Helpers
-# ---------------------------
+# =========================
 def decide_genre(selected_genres: list[str]) -> str:
-    """Pick the most frequent genre. If tie, break by priority."""
+    """Most frequent genre; tie-break with priority."""
     priority = ["로맨스/드라마", "액션/어드벤처", "SF/판타지", "코미디"]
     counts = {g: 0 for g in GENRE_INFO.keys()}
     for g in selected_genres:
@@ -115,20 +114,17 @@ def decide_genre(selected_genres: list[str]) -> str:
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 10)
-def fetch_movies(api_key: str, genre_ids: list[int], language: str = "ko-KR", page: int = 1):
+def fetch_movies(api_key: str, genre_ids: list[int], language: str = "ko-KR"):
     """
-    Fetch popular movies from TMDB Discover by genres.
-    Uses 'with_genres' as comma-separated which means AND by default in TMDB.
-    To keep results broad, we'll try:
-      1) first ID only
-      2) if not enough, try each ID and merge
+    Fetch popular movies from TMDB Discover.
+    We'll fetch with the primary genre first, then (if needed) merge from the secondary.
     """
     base_url = "https://api.themoviedb.org/3/discover/movie"
 
-    def call(with_genres: str):
+    def call(gid: int, page: int = 1):
         params = {
             "api_key": api_key,
-            "with_genres": with_genres,
+            "with_genres": str(gid),
             "language": language,
             "sort_by": "popularity.desc",
             "page": page,
@@ -137,79 +133,62 @@ def fetch_movies(api_key: str, genre_ids: list[int], language: str = "ko-KR", pa
         r.raise_for_status()
         return r.json().get("results", [])
 
-    results = []
-    seen = set()
+    results, seen = [], set()
 
-    # 1) first genre only (broad, usually enough)
-    primary = call(str(genre_ids[0]))
-    for m in primary:
-        mid = m.get("id")
-        if mid and mid not in seen:
-            seen.add(mid)
-            results.append(m)
-
-    # 2) if still not enough and we have multiple ids, merge from others
-    if len(results) < 10 and len(genre_ids) > 1:
-        for gid in genre_ids[1:]:
-            more = call(str(gid))
-            for m in more:
+    for gid in genre_ids:
+        # 두 페이지 정도까지 섞어주면 5개 뽑기 안정적
+        for page in (1, 2):
+            for m in call(gid, page=page):
                 mid = m.get("id")
-                if mid and mid not in seen:
-                    seen.add(mid)
-                    results.append(m)
-                if len(results) >= 20:
-                    break
+                if not mid or mid in seen:
+                    continue
+                seen.add(mid)
+                results.append(m)
+            if len(results) >= 25:
+                break
+        if len(results) >= 25:
+            break
 
     return results
 
 
 def movie_reason(user_genre: str, movie: dict) -> str:
-    """
-    Simple explanation based on selected genre + movie metadata.
-    Keep it short and friendly.
-    """
-    title = movie.get("title") or movie.get("name") or "이 작품"
-    vote = movie.get("vote_average")
+    """Short explanation per genre."""
     overview = (movie.get("overview") or "").strip()
 
     if user_genre == "로맨스/드라마":
         base = "감정선과 관계의 흐름에 몰입하기 좋은 타입이라"
-        extra = "여운이 남는 이야기" if overview else "캐릭터 중심 전개"
+        extra = "여운이 남는 스토리" if overview else "인물 중심 서사"
     elif user_genre == "액션/어드벤처":
         base = "전개가 빠르고 사건이 몰아치는 걸 좋아해서"
-        extra = "긴장감 있는 흐름" if overview else "속도감 있는 분위기"
+        extra = "긴장감 있는 전개" if overview else "속도감 있는 액션"
     elif user_genre == "SF/판타지":
-        base = "세계관/설정에 끌리는 편이라"
+        base = "세계관·설정에 끌리는 편이라"
         extra = "상상력 자극하는 설정" if overview else "독특한 분위기"
-    else:  # 코미디
-        base = "웃으며 보기 좋은 작품을 선호해서"
-        extra = "가볍게 즐기기 좋은 톤" if overview else "텐션 좋은 전개"
+    else:
+        base = "가볍게 웃으며 보기 좋은 작품을 선호해서"
+        extra = "기분 전환에 좋은 톤" if overview else "유쾌한 템포"
 
-    score = f" (평점 {vote:.1f})" if isinstance(vote, (int, float)) else ""
-    return f"{title}{score}은/는 {base} **{extra}**가 잘 맞는 추천이에요."
+    return f"{base} **{extra}**가 잘 맞는 작품이에요."
 
 
-# ---------------------------
+# =========================
 # Render questions
-# ---------------------------
+# =========================
 selected = []
-answers = {}
 
 for idx, item in enumerate(questions, start=1):
     option_labels = [f"{text}  —  [{genre}]" for genre, text in item["options"]]
     choice = st.radio(item["q"], option_labels, index=None, key=f"q{idx}")
     if choice is not None:
-        # Extract genre from label suffix "[장르]"
         genre = choice.split("[")[-1].replace("]", "").strip()
         selected.append(genre)
-        answers[idx] = choice
-    st.write("")
 
 st.divider()
 
-# ---------------------------
-# Submit button
-# ---------------------------
+# =========================
+# Result
+# =========================
 if st.button("결과 보기", type="primary"):
     if not api_key:
         st.error("사이드바에 TMDB API Key를 먼저 입력해줘!")
@@ -219,29 +198,30 @@ if st.button("결과 보기", type="primary"):
         st.warning("5개 질문 모두 선택해야 결과를 볼 수 있어요.")
         st.stop()
 
-    # 1) Analyze answers -> decide genre
     final_genre = decide_genre(selected)
     info = GENRE_INFO[final_genre]
 
-    st.subheader(f"당신의 추천 장르: **{info['label']}**")
+    # 요구사항 1) 제목
+    st.markdown(f"## ✨ 당신에게 딱인 장르는: **{info['label']}!**")
     st.caption(info["reason"])
+    st.write("")
 
-    # 2) Fetch movies from TMDB
-    with st.spinner("분석 중... (TMDB에서 영화 찾는 중)"):
+    poster_base = "https://image.tmdb.org/t/p/w500"
+
+    # 요구사항 5) 로딩 스피너
+    with st.spinner("분석 중... (TMDB에서 인기 영화를 불러오는 중)"):
         try:
             movies = fetch_movies(api_key, info["tmdb_ids"], language="ko-KR")
-        except requests.HTTPError as e:
+        except requests.HTTPError:
             st.error("TMDB 요청에 실패했어요. API Key가 맞는지 확인해줘요.")
-            st.exception(e)
             st.stop()
         except Exception as e:
             st.error("영화 데이터를 가져오는 중 오류가 발생했어요.")
             st.exception(e)
             st.stop()
 
-    # 3) Take top 5 movies with poster if possible
-    # Prefer movies with posters
-    movies_sorted = sorted(movies, key=lambda m: (m.get("poster_path") is None, ), reverse=False)
+    # 상위 5개 (포스터 있는 것 우선)
+    movies_sorted = sorted(movies, key=lambda m: (m.get("poster_path") is None, -(m.get("vote_average") or 0)))
     top5 = []
     seen_titles = set()
     for m in movies_sorted:
@@ -257,32 +237,33 @@ if st.button("결과 보기", type="primary"):
         st.info("추천할 영화를 찾지 못했어요. 잠시 후 다시 시도해줘요.")
         st.stop()
 
-    st.markdown("## 🎥 추천 영화 5편")
+    st.markdown("### 🎥 추천 영화")
 
-    poster_base = "https://image.tmdb.org/t/p/w500"
+    # 요구사항 2) 3열 카드 레이아웃
+    cols = st.columns(3, gap="large")
 
-    for m in top5:
+    for i, m in enumerate(top5):
         title = m.get("title") or "제목 없음"
         rating = m.get("vote_average")
         overview = (m.get("overview") or "줄거리 정보가 없어요.").strip()
         poster_path = m.get("poster_path")
 
-        col1, col2 = st.columns([1, 2], vertical_alignment="top")
+        with cols[i % 3]:
+            # "카드" 느낌을 위해 컨테이너 + 보더
+            with st.container(border=True):
+                # 요구사항 3) 포스터/제목/평점
+                if poster_path:
+                    st.image(poster_base + poster_path, use_container_width=True)
+                else:
+                    st.caption("포스터 없음")
 
-        with col1:
-            if poster_path:
-                st.image(poster_base + poster_path, use_container_width=True)
-            else:
-                st.caption("포스터 없음")
+                st.markdown(f"**{title}**")
+                if isinstance(rating, (int, float)):
+                    st.write(f"⭐ 평점: **{rating:.1f}**")
+                else:
+                    st.write("⭐ 평점: 정보 없음")
 
-        with col2:
-            st.subheader(title)
-            if isinstance(rating, (int, float)):
-                st.write(f"⭐ 평점: **{rating:.1f}**")
-            else:
-                st.write("⭐ 평점: 정보 없음")
-
-            st.write(overview)
-            st.info("💡 " + movie_reason(final_genre, m))
-
-        st.divider()
+                # 요구사항 4) 상세 정보 expander
+                with st.expander("상세 보기"):
+                    st.write(overview)
+                    st.info("💡 " + movie_reason(final_genre, m))
