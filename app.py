@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import requests
 import streamlit as st
 from openai import OpenAI
 
@@ -33,6 +34,9 @@ THEME = {
 }
 
 DEFAULT_MODEL = "gpt-4o-2024-08-06"
+
+TMDB_BASE = "https://api.themoviedb.org/3"
+TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 
 
 # =========================
@@ -70,13 +74,8 @@ def get_secret(key_name: str) -> Optional[str]:
     return None
 
 
-def get_api_key_openai() -> Optional[str]:
-    """
-    우선순위:
-    1) st.secrets["OPENAI_API_KEY"]
-    2) 환경변수 OPENAI_API_KEY
-    3) 사이드바 입력값 (st.session_state["openai_key"])
-    """
+def get_openai_key() -> Optional[str]:
+    # 1) secrets, 2) env, 3) session
     key = get_secret("OPENAI_API_KEY")
     if not key:
         key = os.getenv("OPENAI_API_KEY", "").strip() or None
@@ -85,13 +84,8 @@ def get_api_key_openai() -> Optional[str]:
     return key.strip() if isinstance(key, str) and key.strip() else None
 
 
-def get_api_key_tmdb() -> Optional[str]:
-    """
-    우선순위:
-    1) st.secrets["TMDB_API_KEY"]
-    2) 환경변수 TMDB_API_KEY
-    3) 사이드바 입력값 (st.session_state["tmdb_key"])
-    """
+def get_tmdb_key() -> Optional[str]:
+    # 1) secrets, 2) env, 3) session
     key = get_secret("TMDB_API_KEY")
     if not key:
         key = os.getenv("TMDB_API_KEY", "").strip() or None
@@ -100,23 +94,8 @@ def get_api_key_tmdb() -> Optional[str]:
     return key.strip() if isinstance(key, str) and key.strip() else None
 
 
-def get_api_key_unsplash() -> Optional[str]:
-    """
-    우선순위:
-    1) st.secrets["UNSPLASH_ACCESS_KEY"]
-    2) 환경변수 UNSPLASH_ACCESS_KEY
-    3) 사이드바 입력값 (st.session_state["unsplash_key"])
-    """
-    key = get_secret("UNSPLASH_ACCESS_KEY")
-    if not key:
-        key = os.getenv("UNSPLASH_ACCESS_KEY", "").strip() or None
-    if not key:
-        key = st.session_state.get("unsplash_key", None)
-    return key.strip() if isinstance(key, str) and key.strip() else None
-
-
 def ensure_openai_key_or_stop() -> str:
-    key = get_api_key_openai()
+    key = get_openai_key()
     if not key:
         st.error(
             "OpenAI API Key가 필요해요.\n\n"
@@ -148,11 +127,14 @@ def build_user_prompt(
 요청:
 위 상황에서 "지금 이 순간에 어울리는" 소규모 일상 활동을 3개 이내로 추천해줘.
 각 추천은 과하지 않고 현실적으로 바로 실행 가능한 것으로.
+추천은 한국어로, 너무 길지 않게.
 """.strip()
 
     if extra_constraints.strip():
         base += f"\n\n추가 제약/선호:\n{extra_constraints.strip()}\n"
 
+    # TMDB 검색에 쓸 키워드도 같이 달라고 요청(짧고 일반적인 단어 1~3개)
+    base += "\n\n추가 요청: 각 추천마다 TMDB 검색에 쓸 '검색 키워드'를 1~3개 한국어 또는 영어 단어로 포함해줘."
     return base
 
 
@@ -164,7 +146,7 @@ def recommendations_schema() -> Dict[str, Any]:
             "additionalProperties": False,
             "properties": {
                 "headline": {"type": "string"},
-                "tone": {"type": "string", "description": "결과 화면 문구 톤(예: 차분한, 따뜻한, 발랄한 등)"},
+                "tone": {"type": "string"},
                 "recommendations": {
                     "type": "array",
                     "minItems": 1,
@@ -174,17 +156,23 @@ def recommendations_schema() -> Dict[str, Any]:
                         "additionalProperties": False,
                         "properties": {
                             "title": {"type": "string"},
-                            "one_liner": {"type": "string", "description": "짧은 설명(한 줄)"},
-                            "reason": {"type": "string", "description": "부담 없는 이유(한 문장)"},
+                            "one_liner": {"type": "string"},
+                            "reason": {"type": "string"},
                             "how_to_start": {
                                 "type": "array",
                                 "minItems": 1,
                                 "maxItems": 3,
                                 "items": {"type": "string"},
-                                "description": "바로 시작할 수 있는 1~3단계",
+                            },
+                            "tmdb_keywords": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 3,
+                                "items": {"type": "string"},
+                                "description": "TMDB 검색용 키워드 1~3개",
                             },
                         },
-                        "required": ["title", "one_liner", "reason", "how_to_start"],
+                        "required": ["title", "one_liner", "reason", "how_to_start", "tmdb_keywords"],
                     },
                 },
             },
@@ -207,7 +195,8 @@ def call_openai_recommendations(
     system_instructions = (
         "너는 사용자의 감정과 상황을 이해하고, 과도하지 않으면서 바로 실행 가능한 "
         "소규모 일상 활동 선택지를 제안하는 라이프스타일 추천 도우미다. "
-        "항상 3개 이내로 추천하고, 각각에 부담 없는 이유를 한 문장으로 덧붙여라."
+        "항상 3개 이내로 추천하고, 각각에 부담 없는 이유를 한 문장으로 덧붙여라. "
+        "TMDB 검색 키워드는 너무 구체적인 고유명사보다, 일반 키워드를 선호한다."
     )
 
     user_prompt = build_user_prompt(mood, weather, vibe, time_budget, extra_constraints)
@@ -226,8 +215,46 @@ def call_openai_recommendations(
             }
         },
     )
-
     return json.loads(resp.output_text)
+
+
+# =========================
+# TMDB
+# =========================
+def tmdb_search_multi(api_key: str, query: str, language: str = "ko-KR") -> List[Dict[str, Any]]:
+    """
+    TMDB multi search로 영화/TV/인물 통합 검색.
+    포스터/제목/개요/타입 정도만 반환.
+    """
+    try:
+        r = requests.get(
+            f"{TMDB_BASE}/search/multi",
+            params={"api_key": api_key, "query": query, "language": language, "include_adult": "false"},
+            timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return []
+
+    results = []
+    for item in (data.get("results") or [])[:5]:
+        media_type = item.get("media_type")
+        title = item.get("title") or item.get("name") or "Untitled"
+        overview = item.get("overview") or ""
+        poster_path = item.get("poster_path") or item.get("profile_path")
+        poster_url = f"{TMDB_IMG}{poster_path}" if poster_path else None
+
+        results.append(
+            {
+                "media_type": media_type,
+                "title": title,
+                "overview": overview,
+                "poster_url": poster_url,
+                "id": item.get("id"),
+            }
+        )
+    return results
 
 
 # =========================
@@ -275,13 +302,25 @@ div.stButton > button:hover {{
   margin-right: 6px;
   font-size: 0.85rem;
 }}
+.tmdb-row {{
+  border-top: 1px dashed rgba(0,0,0,0.12);
+  margin-top: 10px;
+  padding-top: 10px;
+}}
 </style>
 """,
         unsafe_allow_html=True,
     )
 
 
-def render_reco_cards(reco_payload: Dict[str, Any], mood: str, weather: str, vibe: str, time_budget: str) -> None:
+def render_reco_cards(
+    reco_payload: Dict[str, Any],
+    mood: str,
+    weather: str,
+    vibe: str,
+    time_budget: str,
+    tmdb_key: Optional[str],
+) -> None:
     headline = reco_payload.get("headline", "오늘의 추천")
     tone = reco_payload.get("tone", "기본")
     recos = reco_payload.get("recommendations", [])
@@ -316,8 +355,10 @@ def render_reco_cards(reco_payload: Dict[str, Any], mood: str, weather: str, vib
         one_liner = r.get("one_liner", "")
         reason = r.get("reason", "")
         how_to = r.get("how_to_start", [])
+        keywords = r.get("tmdb_keywords", [])
 
         steps_html = "".join([f"<li>{step}</li>" for step in how_to]) if how_to else "<li>바로 해보기</li>"
+        keyword_str = ", ".join([k for k in keywords if isinstance(k, str) and k.strip()])
 
         st.markdown(
             f"""
@@ -330,10 +371,42 @@ def render_reco_cards(reco_payload: Dict[str, Any], mood: str, weather: str, vib
       {steps_html}
     </ol>
   </div>
+  <div class="tmdb-row">
+    <div style="font-weight:700; margin-bottom:6px;">🎬 함께 보기(영화/드라마) — 키워드: {keyword_str if keyword_str else "없음"}</div>
 </div>
 """,
             unsafe_allow_html=True,
         )
+
+        # TMDB 검색 결과 렌더
+        if not tmdb_key:
+            st.info("TMDB API Key가 없어서 영화/드라마 추천을 표시할 수 없어요. 사이드바에 TMDB 키를 입력해 주세요.")
+            continue
+
+        # 키워드가 없으면 title로 검색
+        q = keyword_str if keyword_str else title
+        results = tmdb_search_multi(tmdb_key, q)
+
+        if not results:
+            st.caption("TMDB 검색 결과가 없어요.")
+            continue
+
+        # 최대 3개만 보여주기
+        for item in results[:3]:
+            cols = st.columns([1, 3], gap="small")
+            with cols[0]:
+                if item["poster_url"]:
+                    st.image(item["poster_url"], use_container_width=True)
+                else:
+                    st.caption("포스터 없음")
+            with cols[1]:
+                mt = item.get("media_type", "")
+                mt_label = {"movie": "영화", "tv": "TV", "person": "인물"}.get(mt, mt)
+                st.markdown(f"**{item['title']}**  ·  {mt_label}")
+                if item.get("overview"):
+                    st.caption(item["overview"][:200] + ("…" if len(item["overview"]) > 200 else ""))
+                else:
+                    st.caption("요약이 없어요.")
 
 
 # =========================
@@ -342,7 +415,7 @@ def render_reco_cards(reco_payload: Dict[str, Any], mood: str, weather: str, vib
 st.set_page_config(page_title=APP_NAME, page_icon="✨", layout="wide")
 
 # Session state init
-for k in ["current_payload", "current_inputs", "openai_key", "tmdb_key", "unsplash_key"]:
+for k in ["current_payload", "current_inputs", "openai_key", "tmdb_key"]:
     if k not in st.session_state:
         st.session_state[k] = None
 
@@ -351,27 +424,27 @@ with st.sidebar:
     st.markdown(f"## {APP_NAME}")
     st.caption(APP_TAGLINE)
 
-    # ---- 사용자가 원한 UI 그대로 병합 ----
     st.header("🔑 API 키 설정")
-    openai_key_input = st.text_input("OpenAI API Key", type="password", value="" if st.session_state.openai_key is None else st.session_state.openai_key)
-    tmdb_key_input = st.text_input("TMDB API Key", type="password", value="" if st.session_state.tmdb_key is None else st.session_state.tmdb_key)
-    unsplash_key_input = st.text_input("Unsplash Access Key", type="password", value="" if st.session_state.unsplash_key is None else st.session_state.unsplash_key)
+    openai_key_input = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        value="" if st.session_state.openai_key is None else st.session_state.openai_key,
+    )
+    tmdb_key_input = st.text_input(
+        "TMDB API Key",
+        type="password",
+        value="" if st.session_state.tmdb_key is None else st.session_state.tmdb_key,
+    )
 
-    # 세션에 저장(페이지 새로고침/재실행 전까지 유지)
     if openai_key_input.strip():
         st.session_state.openai_key = openai_key_input.strip()
     if tmdb_key_input.strip():
         st.session_state.tmdb_key = tmdb_key_input.strip()
-    if unsplash_key_input.strip():
-        st.session_state.unsplash_key = unsplash_key_input.strip()
 
-    # 현재 상태 표시
-    st.caption(f"OpenAI Key: {'✅' if get_api_key_openai() else '❌'}")
-    st.caption(f"TMDB Key: {'✅' if get_api_key_tmdb() else '❌'}")
-    st.caption(f"Unsplash Key: {'✅' if get_api_key_unsplash() else '❌'}")
+    st.caption(f"OpenAI Key: {'✅' if get_openai_key() else '❌'}")
+    st.caption(f"TMDB Key: {'✅' if get_tmdb_key() else '❌'}")
 
     st.markdown("---")
-
     model = st.text_input("모델", value=DEFAULT_MODEL, help="Structured Outputs 지원 모델 권장")
 
     st.markdown("---")
@@ -424,11 +497,13 @@ with col_left:
         save_btn = st.button("💾 저장하기", use_container_width=True, disabled=st.session_state.current_payload is None)
 
     if go or reroll:
-        api_key = ensure_openai_key_or_stop()
+        openai_key = ensure_openai_key_or_stop()
+        tmdb_key = get_tmdb_key()
+
         with st.spinner("추천을 만드는 중..."):
             try:
                 payload = call_openai_recommendations(
-                    api_key=api_key,
+                    api_key=openai_key,
                     model=model,
                     mood=mood,
                     weather=weather,
@@ -448,9 +523,7 @@ with col_left:
             "time_budget": time_budget,
             "extra_constraints": extra,
             "model": model,
-            # 참고로 나중에 외부 API 연동할 때 쓰기 쉽도록 같이 저장
-            "tmdb_key_set": bool(get_api_key_tmdb()),
-            "unsplash_key_set": bool(get_api_key_unsplash()),
+            "tmdb_enabled": bool(tmdb_key),
         }
 
     if save_btn and st.session_state.current_payload and st.session_state.current_inputs:
@@ -468,13 +541,18 @@ with col_right:
         st.info("왼쪽에서 기분/날씨/분위기/시간을 고르고 **추천 받기**를 눌러주세요.")
     else:
         inp = st.session_state.current_inputs or {}
+        tmdb_key = get_tmdb_key()
         render_reco_cards(
             st.session_state.current_payload,
             inp.get("mood", mood),
             inp.get("weather", weather),
             inp.get("vibe", vibe),
             inp.get("time_budget", time_budget),
+            tmdb_key=tmdb_key,
         )
 
 st.markdown("---")
-st.caption("보안 팁: 배포 시엔 secrets.toml 또는 환경변수 사용을 권장해요. 사이드바 입력은 세션에만 저장됩니다.")
+st.caption(
+    "보안 팁: 배포 시엔 `.streamlit/secrets.toml` 또는 환경변수 사용을 권장해요. "
+    "사이드바 입력은 세션에만 저장됩니다."
+)
