@@ -1,11 +1,11 @@
 import requests
+import random
 
-WEATHER_API_KEY = "YOUR_KEY"
-city = "Seoul"
-
-url = f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric&lang=kr"
+# 랜덤 포켓몬 가져오기
+pokemon_id = random.randint(1, 151)
+url = f"https://pokeapi.co/api/v2/pokemon/{pokemon_id}"
 response = requests.get(url)
 data = response.json()
 
-print(f"🌡️ 서울 기온: {data['main']['temp']}°C")
-print(f"☁️ 날씨: {data['weather'][0]['description']}")
+print(f"👾 포켓몬: {data['name']}")
+print(f"🖼️ 이미지: {data['sprites']['front_default']}")
