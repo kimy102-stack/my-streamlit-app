@@ -2,7 +2,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
@@ -131,15 +131,12 @@ def build_user_prompt(
     if extra_constraints.strip():
         base += f"\n\n추가 제약/선호:\n{extra_constraints.strip()}\n"
 
+    # TMDB 검색 fallback용 키워드 (작품 제목이 아니라 분위기/장르에 가까운 일반 단어)
     base += "\n\n추가 요청: 각 추천마다 TMDB 검색에 쓸 '검색 키워드'를 1~3개 단어(한국어 또는 영어)로 포함해줘."
     return base
 
 
 def recommendations_json_schema() -> Dict[str, Any]:
-    """
-    중요: 여기서는 'schema'만 반환합니다.
-    name은 text.format.name 으로 별도로 넣어야 합니다.
-    """
     return {
         "type": "object",
         "additionalProperties": False,
@@ -205,7 +202,6 @@ def call_openai_recommendations(
             {"role": "system", "content": system_instructions},
             {"role": "user", "content": user_prompt},
         ],
-        # ✅ 핵심 수정: text.format.name 필수 + schema는 '순수 schema'만
         text={
             "format": {
                 "type": "json_schema",
@@ -215,13 +211,105 @@ def call_openai_recommendations(
             }
         },
     )
-
     return json.loads(resp.output_text)
 
 
 # =========================
-# TMDB
+# TMDB (Discover-first + Weighting + TV Toggle)
 # =========================
+# TMDB Genre IDs (movie/tv 공통으로 많이 쓰임)
+GENRE = {
+    "action": 28,
+    "adventure": 12,
+    "animation": 16,
+    "comedy": 35,
+    "crime": 80,
+    "documentary": 99,
+    "drama": 18,
+    "family": 10751,
+    "fantasy": 14,
+    "history": 36,
+    "horror": 27,
+    "music": 10402,
+    "mystery": 9648,
+    "romance": 10749,
+    "scifi": 878,
+    "thriller": 53,
+    "war": 10752,
+}
+
+# "가중치"를 단순화해서: (primary_genres, secondary_genres)로 구성하고
+# primary를 먼저 시도 → 부족하면 secondary 섞기
+MOOD_TO_GENRES_WEIGHTED = {
+    "피곤함": ([GENRE["comedy"], GENRE["animation"], GENRE["family"]], [GENRE["fantasy"], GENRE["music"], GENRE["drama"]]),
+    "우울함": ([GENRE["drama"], GENRE["music"]], [GENRE["comedy"], GENRE["romance"], GENRE["mystery"]]),
+    "설렘": ([GENRE["romance"], GENRE["comedy"], GENRE["fantasy"]], [GENRE["drama"], GENRE["adventure"]]),
+    "무기력": ([GENRE["adventure"], GENRE["action"], GENRE["comedy"]], [GENRE["thriller"], GENRE["fantasy"], GENRE["crime"]]),
+}
+
+# vibe(상황)로 장르를 보정(가중치 느낌)
+VIBE_GENRE_BOOST = {
+    "혼자": [GENRE["mystery"], GENRE["drama"]],
+    "친구와": [GENRE["comedy"], GENRE["adventure"]],
+    "데이트": [GENRE["romance"], GENRE["comedy"]],
+    "집에 있음": [GENRE["animation"], GENRE["family"], GENRE["documentary"]],
+}
+
+WEATHER_GENRE_BOOST = {
+    "맑음": [GENRE["adventure"], GENRE["comedy"]],
+    "비": [GENRE["drama"], GENRE["mystery"]],
+    "흐림": [GENRE["fantasy"], GENRE["thriller"]],
+}
+
+
+def tmdb_discover(
+    api_key: str,
+    media: str,  # "movie" or "tv"
+    genres: List[int],
+    language: str = "ko-KR",
+    region: str = "KR",
+    vote_count_gte: int = 150,
+    page: int = 1,
+) -> List[Dict[str, Any]]:
+    endpoint = f"{TMDB_BASE}/discover/{media}"
+    params = {
+        "api_key": api_key,
+        "language": language,
+        "sort_by": "popularity.desc",
+        "include_adult": "false",
+        "with_genres": ",".join(map(str, genres)) if genres else "",
+        "vote_count.gte": vote_count_gte,
+        "page": page,
+    }
+    # movie 전용 region 파라미터 (tv는 무시해도 되지만 넣어도 문제는 거의 없음)
+    if region:
+        params["region"] = region
+
+    try:
+        r = requests.get(endpoint, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+    except Exception:
+        return []
+
+    results = []
+    for item in (data.get("results") or []):
+        title = item.get("title") or item.get("name") or "Untitled"
+        overview = item.get("overview") or ""
+        poster_path = item.get("poster_path")
+        poster_url = f"{TMDB_IMG}{poster_path}" if poster_path else None
+        results.append(
+            {
+                "media_type": media,
+                "title": title,
+                "overview": overview,
+                "poster_url": poster_url,
+                "id": item.get("id"),
+            }
+        )
+    return results
+
+
 def tmdb_search_multi(api_key: str, query: str, language: str = "ko-KR") -> List[Dict[str, Any]]:
     try:
         r = requests.get(
@@ -235,13 +323,14 @@ def tmdb_search_multi(api_key: str, query: str, language: str = "ko-KR") -> List
         return []
 
     results = []
-    for item in (data.get("results") or [])[:5]:
+    for item in (data.get("results") or []):
         media_type = item.get("media_type")
+        if media_type not in ("movie", "tv"):  # person은 제외(원하면 포함 가능)
+            continue
         title = item.get("title") or item.get("name") or "Untitled"
         overview = item.get("overview") or ""
         poster_path = item.get("poster_path") or item.get("profile_path")
         poster_url = f"{TMDB_IMG}{poster_path}" if poster_path else None
-
         results.append(
             {
                 "media_type": media_type,
@@ -252,6 +341,121 @@ def tmdb_search_multi(api_key: str, query: str, language: str = "ko-KR") -> List
             }
         )
     return results
+
+
+def build_weighted_genre_lists(mood: str, vibe: str, weather: str) -> Tuple[List[int], List[int]]:
+    """
+    primary, secondary 장르 리스트 생성
+    - mood 기반 primary/secondary
+    - vibe/weather는 primary에 우선 가볍게 섞어 '가중치' 느낌을 줌
+    """
+    base_primary, base_secondary = MOOD_TO_GENRES_WEIGHTED.get(mood, ([GENRE["comedy"], GENRE["drama"]], [GENRE["romance"]]))
+
+    boosts = []
+    boosts += VIBE_GENRE_BOOST.get(vibe, [])
+    boosts += WEATHER_GENRE_BOOST.get(weather, [])
+
+    # primary는 base_primary + boosts(중복 제거)
+    primary = []
+    seen = set()
+    for g in (base_primary + boosts):
+        if g not in seen:
+            seen.add(g)
+            primary.append(g)
+
+    # secondary는 base_secondary + (base_primary 일부) + boosts 일부 (중복 제거)
+    secondary = []
+    seen2 = set()
+    for g in (base_secondary + base_primary + boosts):
+        if g not in seen2:
+            seen2.add(g)
+            secondary.append(g)
+
+    return primary, secondary
+
+
+def dedupe_items(items: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    out = []
+    seen = set()
+    for x in items:
+        key = (x.get("media_type"), x.get("id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(x)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def tmdb_get_recommendations_weighted(
+    api_key: str,
+    content_mode: str,  # "movie" | "tv" | "both"
+    mood: str,
+    vibe: str,
+    weather: str,
+    fallback_query: str,
+    language: str,
+    region: str,
+    vote_count_gte: int,
+    n_items: int,
+    use_search_fallback: bool,
+) -> List[Dict[str, Any]]:
+    """
+    1) Discover-first (primary genres)
+    2) 부족하면 Discover (secondary genres)
+    3) still 부족하면 Search fallback (ko→en)
+    """
+    primary, secondary = build_weighted_genre_lists(mood, vibe, weather)
+
+    media_list = []
+    if content_mode == "both":
+        media_list = ["movie", "tv"]
+    else:
+        media_list = [content_mode]
+
+    collected: List[Dict[str, Any]] = []
+
+    # 1) primary discover
+    for media in media_list:
+        collected += tmdb_discover(
+            api_key=api_key,
+            media=media,
+            genres=primary,
+            language=language,
+            region=region,
+            vote_count_gte=vote_count_gte,
+            page=1,
+        )
+
+    collected = dedupe_items(collected, limit=n_items)
+    if len(collected) >= n_items:
+        return collected
+
+    # 2) secondary discover
+    more: List[Dict[str, Any]] = []
+    for media in media_list:
+        more += tmdb_discover(
+            api_key=api_key,
+            media=media,
+            genres=secondary,
+            language=language,
+            region=region,
+            vote_count_gte=max(0, vote_count_gte - 50),  # 조금 완화
+            page=1,
+        )
+    collected = dedupe_items(collected + more, limit=n_items)
+    if len(collected) >= n_items:
+        return collected
+
+    # 3) Search fallback
+    if use_search_fallback:
+        searched = tmdb_search_multi(api_key, fallback_query, language=language)
+        if language != "en-US":
+            searched += tmdb_search_multi(api_key, fallback_query, language="en-US")
+        collected = dedupe_items(collected + searched, limit=n_items)
+
+    return collected
 
 
 # =========================
@@ -310,6 +514,29 @@ div.stButton > button:hover {{
     )
 
 
+def render_tmdb_items(items: List[Dict[str, Any]]) -> None:
+    if not items:
+        st.caption("TMDB에서 추천을 가져오지 못했어요(키/네트워크/설정 확인).")
+        return
+
+    for item in items:
+        cols = st.columns([1, 3], gap="small")
+        with cols[0]:
+            if item.get("poster_url"):
+                st.image(item["poster_url"], use_container_width=True)
+            else:
+                st.caption("포스터 없음")
+        with cols[1]:
+            mt = item.get("media_type", "")
+            mt_label = {"movie": "영화", "tv": "TV"}.get(mt, mt)
+            st.markdown(f"**{item.get('title','Untitled')}**  ·  {mt_label}")
+            overview = item.get("overview") or ""
+            if overview:
+                st.caption(overview[:220] + ("…" if len(overview) > 220 else ""))
+            else:
+                st.caption("요약이 없어요.")
+
+
 def render_reco_cards(
     reco_payload: Dict[str, Any],
     mood: str,
@@ -317,6 +544,12 @@ def render_reco_cards(
     vibe: str,
     time_budget: str,
     tmdb_key: Optional[str],
+    tmdb_content_mode: str,
+    tmdb_language: str,
+    tmdb_region: str,
+    tmdb_vote_count_gte: int,
+    tmdb_n_items: int,
+    tmdb_use_search_fallback: bool,
 ) -> None:
     headline = reco_payload.get("headline", "오늘의 추천")
     tone = reco_payload.get("tone", "기본")
@@ -369,38 +602,34 @@ def render_reco_cards(
     </ol>
   </div>
   <div class="tmdb-row">
-    <div style="font-weight:700; margin-bottom:6px;">🎬 함께 보기(영화/드라마) — 키워드: {keyword_str if keyword_str else "없음"}</div>
+    <div style="font-weight:700; margin-bottom:6px;">
+      🎬 함께 보기({ "영화" if tmdb_content_mode=="movie" else ("TV" if tmdb_content_mode=="tv" else "영화/TV") })
+      — 키워드: {keyword_str if keyword_str else "없음"}
+    </div>
 </div>
 """,
             unsafe_allow_html=True,
         )
 
         if not tmdb_key:
-            st.info("TMDB API Key가 없어서 영화/드라마 추천을 표시할 수 없어요. 사이드바에 TMDB 키를 입력해 주세요.")
+            st.info("TMDB API Key가 없어서 영화/TV 추천을 표시할 수 없어요. 사이드바에 TMDB 키를 입력해 주세요.")
             continue
 
-        q = keyword_str if keyword_str else title
-        results = tmdb_search_multi(tmdb_key, q)
-
-        if not results:
-            st.caption("TMDB 검색 결과가 없어요.")
-            continue
-
-        for item in results[:3]:
-            cols = st.columns([1, 3], gap="small")
-            with cols[0]:
-                if item["poster_url"]:
-                    st.image(item["poster_url"], use_container_width=True)
-                else:
-                    st.caption("포스터 없음")
-            with cols[1]:
-                mt = item.get("media_type", "")
-                mt_label = {"movie": "영화", "tv": "TV", "person": "인물"}.get(mt, mt)
-                st.markdown(f"**{item['title']}**  ·  {mt_label}")
-                if item.get("overview"):
-                    st.caption(item["overview"][:200] + ("…" if len(item["overview"]) > 200 else ""))
-                else:
-                    st.caption("요약이 없어요.")
+        fallback_q = keyword_str if keyword_str else title
+        items = tmdb_get_recommendations_weighted(
+            api_key=tmdb_key,
+            content_mode=tmdb_content_mode,
+            mood=mood,
+            vibe=vibe,
+            weather=weather,
+            fallback_query=fallback_q,
+            language=tmdb_language,
+            region=tmdb_region,
+            vote_count_gte=tmdb_vote_count_gte,
+            n_items=tmdb_n_items,
+            use_search_fallback=tmdb_use_search_fallback,
+        )
+        render_tmdb_items(items)
 
 
 # =========================
@@ -408,10 +637,36 @@ def render_reco_cards(
 # =========================
 st.set_page_config(page_title=APP_NAME, page_icon="✨", layout="wide")
 
-for k in ["current_payload", "current_inputs", "openai_key", "tmdb_key"]:
+for k in [
+    "current_payload",
+    "current_inputs",
+    "openai_key",
+    "tmdb_key",
+    "tmdb_content_mode",
+    "tmdb_language",
+    "tmdb_region",
+    "tmdb_vote_count_gte",
+    "tmdb_n_items",
+    "tmdb_use_search_fallback",
+]:
     if k not in st.session_state:
         st.session_state[k] = None
 
+# Defaults for TMDB options
+if st.session_state.tmdb_content_mode is None:
+    st.session_state.tmdb_content_mode = "both"  # movie | tv | both
+if st.session_state.tmdb_language is None:
+    st.session_state.tmdb_language = "ko-KR"
+if st.session_state.tmdb_region is None:
+    st.session_state.tmdb_region = "KR"
+if st.session_state.tmdb_vote_count_gte is None:
+    st.session_state.tmdb_vote_count_gte = 150
+if st.session_state.tmdb_n_items is None:
+    st.session_state.tmdb_n_items = 3
+if st.session_state.tmdb_use_search_fallback is None:
+    st.session_state.tmdb_use_search_fallback = True
+
+# Sidebar
 with st.sidebar:
     st.markdown(f"## {APP_NAME}")
     st.caption(APP_TAGLINE)
@@ -440,6 +695,54 @@ with st.sidebar:
     model = st.text_input("모델", value=DEFAULT_MODEL, help="Structured Outputs 지원 모델 권장")
 
     st.markdown("---")
+    st.subheader("🎛️ 영화/TV 추천 설정")
+
+    # 토글(라디오)
+    st.session_state.tmdb_content_mode = st.radio(
+        "콘텐츠 타입",
+        options=["both", "movie", "tv"],
+        format_func=lambda x: "영화/TV 둘 다" if x == "both" else ("영화" if x == "movie" else "TV"),
+        index=["both", "movie", "tv"].index(st.session_state.tmdb_content_mode),
+        horizontal=False,
+    )
+
+    st.session_state.tmdb_language = st.selectbox(
+        "언어",
+        options=["ko-KR", "en-US", "ja-JP"],
+        index=["ko-KR", "en-US", "ja-JP"].index(st.session_state.tmdb_language),
+        help="ko-KR 추천. 검색 fallback은 자동으로 en-US도 한번 더 시도할 수 있어요.",
+    )
+
+    st.session_state.tmdb_region = st.selectbox(
+        "지역(영화용)",
+        options=["KR", "US", "JP"],
+        index=["KR", "US", "JP"].index(st.session_state.tmdb_region),
+        help="Discover(movie)에서 region에 영향을 줄 수 있어요.",
+    )
+
+    st.session_state.tmdb_n_items = st.slider(
+        "추천 개수(카드당)",
+        min_value=1,
+        max_value=6,
+        value=int(st.session_state.tmdb_n_items),
+        step=1,
+    )
+
+    st.session_state.tmdb_vote_count_gte = st.slider(
+        "최소 평점 참여 수(인기/안정성)",
+        min_value=0,
+        max_value=2000,
+        value=int(st.session_state.tmdb_vote_count_gte),
+        step=50,
+        help="낮출수록 더 많이 나오고, 높일수록 유명작 위주로 나와요.",
+    )
+
+    st.session_state.tmdb_use_search_fallback = st.checkbox(
+        "검색 fallback 사용(Discover 부족할 때 검색으로 보완)",
+        value=bool(st.session_state.tmdb_use_search_fallback),
+    )
+
+    st.markdown("---")
     st.markdown("### 저장된 히스토리")
     history = load_history()
 
@@ -460,6 +763,7 @@ with st.sidebar:
         st.success("히스토리를 삭제했어요. 새로고침하면 목록이 비어요.")
 
 
+# Main UI
 col_left, col_right = st.columns([1.0, 1.2], gap="large")
 
 with col_left:
@@ -489,6 +793,7 @@ with col_left:
 
     if go or reroll:
         openai_key = ensure_openai_key_or_stop()
+
         with st.spinner("추천을 만드는 중..."):
             try:
                 payload = call_openai_recommendations(
@@ -513,6 +818,12 @@ with col_left:
             "extra_constraints": extra,
             "model": model,
             "tmdb_enabled": bool(get_tmdb_key()),
+            "tmdb_content_mode": st.session_state.tmdb_content_mode,
+            "tmdb_language": st.session_state.tmdb_language,
+            "tmdb_region": st.session_state.tmdb_region,
+            "tmdb_vote_count_gte": st.session_state.tmdb_vote_count_gte,
+            "tmdb_n_items": st.session_state.tmdb_n_items,
+            "tmdb_use_search_fallback": st.session_state.tmdb_use_search_fallback,
         }
 
     if save_btn and st.session_state.current_payload and st.session_state.current_inputs:
@@ -537,6 +848,12 @@ with col_right:
             inp.get("vibe", vibe),
             inp.get("time_budget", time_budget),
             tmdb_key=get_tmdb_key(),
+            tmdb_content_mode=st.session_state.tmdb_content_mode,
+            tmdb_language=st.session_state.tmdb_language,
+            tmdb_region=st.session_state.tmdb_region,
+            tmdb_vote_count_gte=int(st.session_state.tmdb_vote_count_gte),
+            tmdb_n_items=int(st.session_state.tmdb_n_items),
+            tmdb_use_search_fallback=bool(st.session_state.tmdb_use_search_fallback),
         )
 
 st.markdown("---")
